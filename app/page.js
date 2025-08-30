@@ -1,8 +1,15 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useMemo,
+  useCallback,
+  useLayoutEffect,
+} from "react";
 import { useRouter } from "next/navigation";
-import { db, auth, storage } from "@/lib/firebase";
+import { db, auth, storage, rtdb } from "@/lib/firebase";
 import {
   doc,
   getDoc,
@@ -15,13 +22,19 @@ import {
   orderBy,
   onSnapshot,
   where,
-  getDocs,
   arrayUnion,
 } from "firebase/firestore";
+import {
+  ref as dbRef,
+  onValue,
+  onDisconnect,
+  set,
+  serverTimestamp as rtdbServerTimestamp,
+} from "firebase/database";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useAuthState } from "react-firebase-hooks/auth";
 import { Toaster, toast } from "sonner";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import {
   ArrowLeft,
   Send,
@@ -29,18 +42,22 @@ import {
   Paperclip,
   Mic,
   Smile,
-  User,
   LoaderCircle,
   Video,
   Phone,
-  X,
   MicOff,
   VideoOff,
   PhoneOff,
   File,
   MessageCircle,
+  Check,
+  CheckCheck,
 } from "lucide-react";
-import { format, formatDistanceToNowStrict } from "date-fns";
+import {
+  format,
+  formatDistanceToNow,
+  formatDistanceToNowStrict,
+} from "date-fns";
 import EmojiPicker from "emoji-picker-react";
 import MicRecorder from "mic-recorder-to-mp3";
 import { v4 as uuidv4 } from "uuid";
@@ -70,12 +87,23 @@ const servers = {
   ],
 };
 
+const UserStatus = ({ user }) => {
+  if (user.status === "online") {
+    return (
+      <span className="absolute bottom-0 right-0 block h-3.5 w-3.5 rounded-full border-2 border-brand-surface bg-green-400 ring-1 ring-green-400"></span>
+    );
+  }
+  return (
+    <span className="absolute bottom-0 right-0 block h-3.5 w-3.5 rounded-full border-2 border-brand-surface bg-zinc-500"></span>
+  );
+};
+
 const UserListItem = ({ user, isSelected, onSelect, lastMessage }) => {
   return (
     <motion.div
       layout
       onClick={() => onSelect(user)}
-      className={`flex items-center gap-4 p-3 cursor-pointer rounded-2xl transition-all duration-300 ${
+      className={`flex cursor-pointer items-center gap-4 rounded-2xl p-3 transition-all duration-300 ${
         isSelected ? "bg-brand-muted" : "hover:bg-brand-surface"
       }`}
     >
@@ -85,23 +113,21 @@ const UserListItem = ({ user, isSelected, onSelect, lastMessage }) => {
           alt={user.displayName}
           className="h-12 w-12 rounded-full"
         />
-        <span
-          className={`absolute bottom-0 right-0 block h-3.5 w-3.5 rounded-full bg-green-400 border-2 border-brand-surface ring-1 ring-green-400`}
-        ></span>
+        <UserStatus user={user} />
       </div>
-      <div className="flex-1 min-w-0">
-        <div className="flex justify-between items-center">
-          <p className="font-semibold text-sm truncate text-zinc-100">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between">
+          <p className="truncate text-sm font-semibold text-zinc-100">
             {user.displayName}
           </p>
           {lastMessage?.createdAt && (
-            <p className="text-xs text-zinc-500 flex-shrink-0 ml-2">
+            <p className="ml-2 flex-shrink-0 text-xs text-zinc-500">
               {formatDistanceToNowStrict(lastMessage.createdAt.toDate())}
             </p>
           )}
         </div>
         {lastMessage && (
-          <p className="text-xs truncate pr-2 text-zinc-400 mt-1">
+          <p className="mt-1 truncate pr-2 text-xs text-zinc-400">
             {lastMessage.text}
           </p>
         )}
@@ -127,12 +153,12 @@ const UserListSidebar = ({
   );
 
   return (
-    <aside className="w-full md:w-[380px] h-screen bg-brand-surface border-r border-brand-subtle flex flex-col flex-shrink-0">
-      <div className="p-4 border-b border-brand-subtle">
-        <div className="flex items-center justify-between mb-4">
+    <aside className="flex h-screen w-full flex-shrink-0 flex-col border-r border-brand-subtle bg-brand-surface md:w-[380px]">
+      <div className="border-b border-brand-subtle p-4">
+        <div className="mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <MessageCircle className="h-7 w-7 text-brand-accent" />
-            <h1 className="text-2xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-br from-white to-zinc-400">
+            <h1 className="bg-gradient-to-br from-white to-zinc-400 bg-clip-text text-2xl font-bold tracking-tight text-transparent">
               VoidChat
             </h1>
           </div>
@@ -143,17 +169,17 @@ const UserListSidebar = ({
           />
         </div>
         <div className="relative">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-600" />
+          <Search className="absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-600" />
           <input
             type="text"
             placeholder="Search connections..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full bg-brand-muted border border-transparent focus:border-brand-accent focus:ring-brand-accent rounded-full pl-10 pr-4 py-2.5 text-sm text-zinc-200 outline-none transition-colors"
+            className="w-full rounded-full border border-transparent bg-brand-muted py-2.5 pl-10 pr-4 text-sm text-zinc-200 outline-none transition-colors focus:border-brand-accent focus:ring-brand-accent"
           />
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto p-2 space-y-1">
+      <div className="flex-1 space-y-1 overflow-y-auto p-2">
         {filteredUsers.map((user) => (
           <UserListItem
             key={user.uid}
@@ -168,7 +194,34 @@ const UserListSidebar = ({
   );
 };
 
-const MessageItem = ({ msg, isCurrentUser }) => {
+const MessageItem = ({ msg, isCurrentUser, chatId, currentUser }) => {
+  const messageRef = useRef(null);
+  const messageDate = msg.createdAt?.toDate();
+  const isSeen = msg.readBy?.includes(
+    isCurrentUser ? msg.receiverId : currentUser.uid
+  );
+
+  useEffect(() => {
+    if (
+      !isCurrentUser &&
+      messageRef.current &&
+      !msg.readBy?.includes(currentUser.uid)
+    ) {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          if (entries[0].isIntersecting) {
+            const msgDocRef = doc(db, "chats", chatId, "messages", msg.id);
+            updateDoc(msgDocRef, { readBy: arrayUnion(currentUser.uid) });
+            observer.disconnect();
+          }
+        },
+        { threshold: 0.8 }
+      );
+      observer.observe(messageRef.current);
+      return () => observer.disconnect();
+    }
+  }, [isCurrentUser, msg.readBy, currentUser.uid, chatId, msg.id]);
+
   const renderContent = () => {
     switch (msg.type) {
       case "image":
@@ -176,37 +229,45 @@ const MessageItem = ({ msg, isCurrentUser }) => {
           <img
             src={msg.mediaUrl}
             alt="uploaded content"
-            className="rounded-xl max-w-xs cursor-pointer"
+            className="max-w-xs cursor-pointer rounded-xl"
             onClick={() => window.open(msg.mediaUrl, "_blank")}
           />
         );
       case "audio":
-        return <audio controls src={msg.mediaUrl} className="w-64 h-11" />;
+        return <audio controls src={msg.mediaUrl} className="h-11 w-64" />;
       case "file":
         return (
           <a
             href={msg.mediaUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-3 bg-brand-accent/10 p-3 rounded-lg hover:bg-brand-accent/20"
+            className="flex items-center gap-3 rounded-lg bg-brand-accent/10 p-3 hover:bg-brand-accent/20"
           >
             <File className="h-8 w-8 text-brand-accent" />
-            <span className="font-medium text-sm text-zinc-200">
+            <span className="text-sm font-medium text-zinc-200">
               {msg.fileName || "Download File"}
             </span>
           </a>
         );
       default:
         return (
-          <div className="prose prose-sm prose-p:my-0 text-white max-w-none break-words whitespace-pre-wrap">
+          <div className="prose prose-sm prose-p:my-0 max-w-none break-words whitespace-pre-wrap text-white">
             {msg.text}
           </div>
         );
     }
   };
-  const messageDate = msg.createdAt?.toDate();
+
+  const MessageStatus = () => {
+    if (!isCurrentUser) return null;
+    if (isSeen) return <CheckCheck className="h-4 w-4 text-blue-400" />;
+    if (msg.createdAt) return <Check className="h-4 w-4 opacity-60" />;
+    return <LoaderCircle className="h-4 w-4 animate-spin opacity-60" />;
+  };
+
   return (
     <motion.div
+      ref={messageRef}
       layout
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
@@ -216,7 +277,7 @@ const MessageItem = ({ msg, isCurrentUser }) => {
       }`}
     >
       <div
-        className={`max-w-md md:max-w-lg rounded-2xl ${
+        className={`max-w-md rounded-2xl md:max-w-lg ${
           isCurrentUser
             ? "bg-brand-accent text-white"
             : "bg-brand-muted text-zinc-200"
@@ -225,9 +286,12 @@ const MessageItem = ({ msg, isCurrentUser }) => {
         }`}
       >
         {renderContent()}
-        <p className={`text-xs mt-1.5 opacity-60 text-right`}>
-          {messageDate ? format(messageDate, "p") : "sending..."}
-        </p>
+        <div
+          className={`mt-1.5 flex items-center justify-end gap-1.5 text-xs opacity-60`}
+        >
+          <span>{messageDate ? format(messageDate, "p") : "sending..."}</span>
+          <MessageStatus />
+        </div>
       </div>
     </motion.div>
   );
@@ -235,7 +299,6 @@ const MessageItem = ({ msg, isCurrentUser }) => {
 
 const VideoCallModal = ({
   callData,
-  pc,
   localStream,
   remoteStream,
   onEndCall,
@@ -246,34 +309,33 @@ const VideoCallModal = ({
 }) => {
   if (!callData?.active) return null;
   return (
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-md flex items-center justify-center z-50">
-      <div className="relative w-full h-full">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md">
+      <div className="relative h-full w-full">
         <video
           ref={(el) => el && (el.srcObject = remoteStream)}
           autoPlay
           playsInline
-          className="w-full h-full object-cover"
+          className="h-full w-full object-cover"
         />
         <video
           ref={(el) => el && (el.srcObject = localStream)}
           autoPlay
           playsInline
           muted
-          className="absolute bottom-28 right-8 w-48 h-36 object-cover rounded-2xl border-2 border-white/20 shadow-2xl"
+          className="absolute bottom-28 right-8 h-36 w-48 rounded-2xl border-2 border-white/20 object-cover shadow-2xl"
         />
-        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-black/40 backdrop-blur-sm p-3 rounded-full border border-white/10">
+        <div className="absolute bottom-8 left-1/2 flex -translate-x-1/2 items-center gap-4 rounded-full border border-white/10 bg-black/40 p-3 backdrop-blur-sm">
           <button
             onClick={onToggleMute}
-            className={`p-4 rounded-full transition-colors ${
+            className={`rounded-full p-4 transition-colors ${
               isMuted ? "bg-white text-black" : "bg-white/20 text-white"
             }`}
           >
-            {" "}
             {isMuted ? <MicOff /> : <Mic />}
           </button>
           <button
             onClick={onToggleVideo}
-            className={`p-4 rounded-full transition-colors ${
+            className={`rounded-full p-4 transition-colors ${
               isVideoOff ? "bg-white text-black" : "bg-white/20 text-white"
             }`}
           >
@@ -281,7 +343,7 @@ const VideoCallModal = ({
           </button>
           <button
             onClick={onEndCall}
-            className="p-4 rounded-full bg-red-500 text-white animate-glow shadow-lg shadow-red-500/50"
+            className="animate-glow rounded-full bg-red-500 p-4 text-white shadow-lg shadow-red-500/50"
           >
             <PhoneOff />
           </button>
@@ -295,12 +357,13 @@ const IncomingCallToast = ({ callData, onAccept, onDecline }) => {
   if (
     !callData ||
     callData.status !== "ringing" ||
+    auth.currentUser === null ||
     callData.to !== auth.currentUser.uid
   )
     return null;
   return (
-    <div className="fixed top-5 right-5 z-50 bg-brand-surface/80 backdrop-blur-xl border border-brand-subtle shadow-2xl shadow-brand-accent/20 p-4 rounded-2xl flex items-center gap-4 animate-fade-in-up">
-      <div className="w-12 h-12 rounded-full bg-brand-accent flex items-center justify-center animate-glow">
+    <div className="fixed top-5 right-5 z-50 flex animate-fade-in-up items-center gap-4 rounded-2xl border border-brand-subtle bg-brand-surface/80 p-4 shadow-2xl shadow-brand-accent/20 backdrop-blur-xl">
+      <div className="animate-glow flex h-12 w-12 items-center justify-center rounded-full bg-brand-accent">
         <Phone className="text-white" />
       </div>
       <div>
@@ -309,13 +372,13 @@ const IncomingCallToast = ({ callData, onAccept, onDecline }) => {
       </div>
       <button
         onClick={onAccept}
-        className="p-3 bg-green-500/20 text-green-400 rounded-full hover:bg-green-500/30"
+        className="rounded-full bg-green-500/20 p-3 text-green-400 hover:bg-green-500/30"
       >
         <Phone />
       </button>
       <button
         onClick={onDecline}
-        className="p-3 bg-red-500/20 text-red-400 rounded-full hover:bg-red-500/30"
+        className="rounded-full bg-red-500/20 p-3 text-red-400 hover:bg-red-500/30"
       >
         <PhoneOff />
       </button>
@@ -338,33 +401,88 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [isCallee, setIsCallee] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const textareaRef = useRef(null);
   const emojiMenuRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
 
   useOnClickOutside(emojiMenuRef, () => setShowEmojiPicker(false));
 
+  const updateTypingStatus = useCallback(
+    async (typing) => {
+      if (!chatId) return;
+      const chatDocRef = doc(db, "chats", chatId);
+      await setDoc(
+        chatDocRef,
+        { typing: typing ? currentUser.uid : null },
+        { merge: true }
+      );
+    },
+    [chatId, currentUser.uid]
+  );
+
+  const handleTyping = (e) => {
+    setNewMessage(e.target.value);
+    if (!typingTimeoutRef.current) {
+      updateTypingStatus(true);
+    }
+    clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      updateTypingStatus(false);
+      typingTimeoutRef.current = null;
+    }, 2000);
+  };
+
   useEffect(() => {
-    if (currentUser?.uid && selectedUser?.uid)
+    if (currentUser?.uid && selectedUser?.uid) {
       setChatId([currentUser.uid, selectedUser.uid].sort().join("_"));
+    } else {
+      setChatId(null);
+    }
   }, [currentUser, selectedUser]);
+
+  const endCall = useCallback(
+    async (isRemote = false) => {
+      if (pc) pc.close();
+      if (localStream) localStream.getTracks().forEach((track) => track.stop());
+      setPc(null);
+      setLocalStream(null);
+      setRemoteStream(null);
+      setCallData(null);
+      setIsMuted(false);
+      setIsVideoOff(false);
+      setIsCallee(false);
+      if (!isRemote && chatId)
+        await updateDoc(doc(db, "chats", chatId), { call: null });
+    },
+    [pc, localStream, chatId]
+  );
+
   useEffect(() => {
-    if (!chatId) return;
+    if (!chatId || !selectedUser) return;
     const chatDocRef = doc(db, "chats", chatId);
     const unsubscribe = onSnapshot(chatDocRef, (doc) => {
-      if (doc.exists() && doc.data().call) {
-        const data = doc.data().call;
-        setCallData({ ...data, fromName: selectedUser.displayName });
-        if (data.status === "ringing" && data.to === currentUser.uid)
-          setIsCallee(true);
-      } else {
-        if (callData) endCall(true);
+      if (doc.exists()) {
+        const data = doc.data();
+        setIsTyping(data.typing && data.typing !== currentUser.uid);
+        if (data.call) {
+          setCallData({ ...data.call, fromName: selectedUser.displayName });
+          if (
+            data.call.status === "ringing" &&
+            data.call.to === currentUser.uid
+          )
+            setIsCallee(true);
+        } else {
+          if (callData) endCall(true);
+        }
       }
     });
     return () => unsubscribe();
-  }, [chatId, currentUser?.uid]);
+  }, [chatId, currentUser?.uid, selectedUser, callData, endCall]);
+
   useEffect(() => {
     if (pc && callData?.answer) {
       pc.setRemoteDescription(new RTCSessionDescription(callData.answer)).catch(
@@ -372,6 +490,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
       );
     }
   }, [pc, callData?.answer]);
+
   useEffect(() => {
     if (pc && callData?.calleeCandidates) {
       callData.calleeCandidates.forEach((candidate) => {
@@ -399,14 +518,17 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
     };
     peerConnection.onicecandidate = async (event) => {
       if (event.candidate)
-        await updateDoc(doc(db, "chats", chatId), {
-          "call.callerCandidates": arrayUnion({ ...event.candidate.toJSON() }),
-        });
+        await setDoc(
+          doc(db, "chats", chatId),
+          { call: { callerCandidates: arrayUnion({ ...event.candidate.toJSON() }) } },
+          { merge: true }
+        );
     };
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
     const callDoc = {
       from: currentUser.uid,
+      fromName: currentUser.displayName,
       to: selectedUser.uid,
       offer: { sdp: offer.sdp, type: offer.type },
       status: "ringing",
@@ -437,19 +559,27 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
     };
     peerConnection.onicecandidate = async (event) => {
       if (event.candidate)
-        await updateDoc(doc(db, "chats", chatId), {
-          "call.calleeCandidates": arrayUnion({ ...event.candidate.toJSON() }),
-        });
+        await setDoc(
+          doc(db, "chats", chatId),
+          { call: { calleeCandidates: arrayUnion({ ...event.candidate.toJSON() }) } },
+          { merge: true }
+        );
     };
     await peerConnection.setRemoteDescription(
       new RTCSessionDescription(callData.offer)
     );
     const answer = await peerConnection.createAnswer();
     await peerConnection.setLocalDescription(answer);
-    await updateDoc(doc(db, "chats", chatId), {
-      "call.answer": { sdp: answer.sdp, type: answer.type },
-      "call.status": "active",
-    });
+    await setDoc(
+      doc(db, "chats", chatId),
+      {
+        call: {
+          answer: { sdp: answer.sdp, type: answer.type },
+          status: "active",
+        },
+      },
+      { merge: true }
+    );
     if (callData?.callerCandidates) {
       callData.callerCandidates.forEach((candidate) => {
         peerConnection
@@ -462,19 +592,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
     setIsCallee(false);
     if (chatId) await updateDoc(doc(db, "chats", chatId), { call: null });
   };
-  const endCall = async (isRemote = false) => {
-    if (pc) pc.close();
-    if (localStream) localStream.getTracks().forEach((track) => track.stop());
-    setPc(null);
-    setLocalStream(null);
-    setRemoteStream(null);
-    setCallData(null);
-    setIsMuted(false);
-    setIsVideoOff(false);
-    setIsCallee(false);
-    if (!isRemote && chatId)
-      await updateDoc(doc(db, "chats", chatId), { call: null });
-  };
+
   const toggleMute = () => {
     if (localStream) {
       localStream
@@ -495,6 +613,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
   useEffect(() => {
     setRecorder(new MicRecorder({ bitRate: 128 }));
   }, []);
+
   useEffect(() => {
     if (!chatId) return;
     const q = query(
@@ -513,9 +632,11 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
     });
     return () => unsubscribe();
   }, [chatId, currentUser, selectedUser]);
-  useEffect(() => {
+
+  useLayoutEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
@@ -529,13 +650,18 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
       await addDoc(collection(db, "chats", chatId, "messages"), {
         ...messageData,
         senderId: currentUser.uid,
+        receiverId: selectedUser.uid,
         createdAt: serverTimestamp(),
+        readBy: [currentUser.uid],
       });
       await updateDoc(doc(db, "chats", chatId), {
         lastMessage: lastMessageText,
         updatedAt: serverTimestamp(),
       });
       setNewMessage("");
+      updateTypingStatus(false);
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = null;
     } catch (error) {
       toast.error("Failed to send message.");
     } finally {
@@ -590,23 +716,31 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
 
   if (!selectedUser)
     return (
-      <div className="hidden lg:flex flex-col h-full items-center justify-center bg-brand-bg text-center p-4">
-        {" "}
-        <MessageCircle className="h-20 w-20 text-brand-subtle mb-4" />{" "}
+      <div className="hidden h-full flex-col items-center justify-center bg-brand-bg p-4 text-center lg:flex">
+        <MessageCircle className="mb-4 h-20 w-20 text-brand-subtle" />
         <h2 className="text-xl font-bold text-zinc-200">
           Select a Conversation
-        </h2>{" "}
-        <p className="text-zinc-500 max-w-xs">
+        </h2>
+        <p className="max-w-xs text-zinc-500">
           Choose a connection from the sidebar to view your message history.
-        </p>{" "}
+        </p>
       </div>
     );
 
+  const userStatusText = () => {
+    if (selectedUser.status === "online") return "Online";
+    if (selectedUser.lastSeen) {
+      return `Last seen ${formatDistanceToNow(
+        selectedUser.lastSeen.toDate()
+      )} ago`;
+    }
+    return "Offline";
+  };
+
   return (
-    <div className="flex flex-col h-screen bg-brand-bg">
+    <div className="flex h-screen flex-col bg-brand-bg">
       <VideoCallModal
         callData={callData}
-        pc={pc}
         localStream={localStream}
         remoteStream={remoteStream}
         onEndCall={endCall}
@@ -620,10 +754,10 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
         onAccept={answerCall}
         onDecline={declineCall}
       />
-      <header className="flex items-center p-4 bg-brand-surface/80 backdrop-blur-lg border-b border-brand-subtle z-10">
+      <header className="z-10 flex items-center border-b border-brand-subtle bg-brand-surface/80 p-4 backdrop-blur-lg">
         <button
           onClick={onBack}
-          className="p-2 rounded-full hover:bg-brand-muted mr-3 lg:hidden"
+          className="mr-3 rounded-full p-2 hover:bg-brand-muted lg:hidden"
         >
           <ArrowLeft className="h-5 w-5 text-zinc-400" />
         </button>
@@ -637,19 +771,21 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
             <h2 className="font-bold text-zinc-100">
               {selectedUser.displayName}
             </h2>
-            <p className="text-xs text-zinc-500">Online</p>
+            <p className="text-xs text-zinc-500">
+              {isTyping ? "typing..." : userStatusText()}
+            </p>
           </div>
         </div>
         <div className="ml-auto flex items-center gap-1">
           <button
             onClick={() => startCall(true)}
-            className="p-2.5 rounded-full hover:bg-brand-muted"
+            className="rounded-full p-2.5 hover:bg-brand-muted"
           >
             <Video className="h-5 w-5 text-zinc-400" />
           </button>
           <button
             onClick={() => startCall(false)}
-            className="p-2.5 rounded-full hover:bg-brand-muted"
+            className="rounded-full p-2.5 hover:bg-brand-muted"
           >
             <Phone className="h-5 w-5 text-zinc-400" />
           </button>
@@ -662,19 +798,21 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
               key={msg.id}
               msg={msg}
               isCurrentUser={msg.senderId === currentUser.uid}
+              chatId={chatId}
+              currentUser={currentUser}
             />
           ))}
           <div ref={messagesEndRef} />
         </div>
       </main>
-      <footer className="p-4 bg-transparent border-t border-brand-subtle">
+      <footer className="border-t border-brand-subtle bg-transparent p-4">
         <form onSubmit={handleSendMessage} className="flex items-start gap-3">
-          <div className="relative w-full flex items-center bg-brand-muted rounded-full border border-brand-subtle focus-within:border-brand-accent transition-colors">
+          <div className="relative flex w-full items-center rounded-full border border-brand-subtle bg-brand-muted transition-colors focus-within:border-brand-accent">
             <textarea
               ref={textareaRef}
               rows={1}
               value={newMessage}
-              onChange={(e) => setNewMessage(e.target.value)}
+              onChange={handleTyping}
               placeholder={isRecording ? "Recording..." : "Type a message..."}
               disabled={isRecording}
               onKeyDown={(e) => {
@@ -683,7 +821,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
                   handleSendMessage(e);
                 }
               }}
-              className="w-full bg-transparent border-transparent focus:ring-0 rounded-full pl-5 pr-24 py-3 text-sm text-zinc-200 resize-none overflow-y-hidden"
+              className="w-full resize-none overflow-y-hidden rounded-full border-transparent bg-transparent py-3 pl-5 pr-24 text-sm text-zinc-200 focus:ring-0"
             />
             <div className="absolute right-4 flex items-center gap-1">
               <input
@@ -697,7 +835,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
               <button
                 type="button"
                 onClick={() => fileInputRef.current.click()}
-                className="p-2 rounded-full hover:bg-brand-subtle"
+                className="rounded-full p-2 hover:bg-brand-subtle"
               >
                 <Paperclip className="h-5 w-5 text-zinc-400" />
               </button>
@@ -705,7 +843,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
                 <button
                   type="button"
                   onClick={() => setShowEmojiPicker(!showEmojiPicker)}
-                  className="p-2 rounded-full hover:bg-brand-subtle"
+                  className="rounded-full p-2 hover:bg-brand-subtle"
                 >
                   <Smile className="h-5 w-5 text-zinc-400" />
                 </button>
@@ -725,9 +863,9 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
           <button
             type="button"
             onClick={handleRecord}
-            className={`p-3.5 rounded-full transition-colors flex-shrink-0 ${
+            className={`flex-shrink-0 rounded-full p-3.5 transition-colors ${
               isRecording
-                ? "bg-red-500 text-white animate-pulse"
+                ? "animate-pulse bg-red-500 text-white"
                 : "bg-brand-muted hover:bg-brand-subtle"
             }`}
           >
@@ -736,7 +874,7 @@ const ChatWindow = ({ selectedUser, currentUser, onBack }) => {
           <button
             type="submit"
             disabled={isSending || !newMessage.trim()}
-            className="grid place-items-center h-12 w-12 flex-shrink-0 bg-brand-accent text-white rounded-full transition-all duration-300 disabled:bg-brand-subtle disabled:cursor-not-allowed hover:scale-110 active:scale-100"
+            className="grid h-12 w-12 flex-shrink-0 place-items-center rounded-full bg-brand-accent text-white transition-all duration-300 hover:scale-110 active:scale-100 disabled:cursor-not-allowed disabled:bg-brand-subtle"
           >
             {isSending ? (
               <LoaderCircle className="h-5 w-5 animate-spin" />
@@ -758,16 +896,81 @@ export default function ChatPage() {
   const [lastMessages, setLastMessages] = useState({});
 
   useEffect(() => {
-    if (!loading && !user) router.push("/login");
+    if (!loading && !user) {
+      router.push("/login");
+    }
   }, [user, loading, router]);
+
+  useEffect(() => {
+    if (user) {
+      const userRef = doc(db, "users", user.uid);
+      setDoc(
+        userRef,
+        {
+          uid: user.uid,
+          displayName: user.displayName,
+          email: user.email,
+          photoURL: user.photoURL,
+        },
+        { merge: true }
+      );
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const userStatusDatabaseRef = dbRef(rtdb, "/status/" + user.uid);
+    const userStatusFirestoreRef = doc(db, "/users/" + user.uid);
+
+    const isOfflineForFirestore = {
+      status: "offline",
+      lastSeen: serverTimestamp(),
+    };
+
+    const isOnlineForFirestore = {
+      status: "online",
+      lastSeen: serverTimestamp(),
+    };
+
+    const connectedRef = dbRef(rtdb, ".info/connected");
+    const unsubscribe = onValue(connectedRef, (snap) => {
+      if (snap.val() === true) {
+        set(userStatusDatabaseRef, isOnlineForFirestore.status);
+        onDisconnect(userStatusDatabaseRef)
+          .set(rtdbServerTimestamp())
+          .then(() => {
+            setDoc(userStatusFirestoreRef, isOfflineForFirestore, { merge: true });
+          });
+        setDoc(userStatusFirestoreRef, isOnlineForFirestore, { merge: true });
+      } else {
+        setDoc(userStatusFirestoreRef, isOfflineForFirestore, { merge: true });
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
   useEffect(() => {
     if (!user) return;
     const q = query(collection(db, "users"), where("uid", "!=", user.uid));
-    const unsubscribe = onSnapshot(q, (snap) =>
-      setAllUsers(snap.docs.map((d) => d.data()))
+    const unsubscribe = onSnapshot(
+      q,
+      (snap) => {
+        const usersData = snap.docs.map((d) => d.data());
+        setAllUsers(usersData);
+        if (selectedUser) {
+          setSelectedUser(usersData.find((u) => u.uid === selectedUser.uid));
+        }
+      },
+      (error) => {
+        console.error("Error fetching users:", error);
+        toast.error("Could not fetch users. Check permissions.");
+      }
     );
     return () => unsubscribe();
-  }, [user]);
+  }, [user, selectedUser]);
+
   useEffect(() => {
     if (!user || allUsers.length === 0) return;
     const unsubscribers = allUsers.map((otherUser) => {
@@ -782,6 +985,19 @@ export default function ChatPage() {
     });
     return () => unsubscribers.forEach((unsub) => unsub());
   }, [allUsers, user]);
+
+  const sortedUsers = useMemo(() => {
+    return [...allUsers].sort((a, b) => {
+      const lastMsgA = lastMessages[a.uid]?.updatedAt;
+      const lastMsgB = lastMessages[b.uid]?.updatedAt;
+      if (lastMsgA && lastMsgB) {
+        return lastMsgB.toMillis() - lastMsgA.toMillis();
+      }
+      if (lastMsgA) return -1;
+      if (lastMsgB) return 1;
+      return 0;
+    });
+  }, [allUsers, lastMessages]);
 
   if (loading || !user)
     return (
@@ -800,7 +1016,7 @@ export default function ChatPage() {
           } w-full lg:w-auto`}
         >
           <UserListSidebar
-            users={allUsers}
+            users={sortedUsers}
             currentUser={user}
             selectedUser={selectedUser}
             onSelectUser={setSelectedUser}
